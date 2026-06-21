@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from queue import Queue, Empty
 from typing import Optional
 
@@ -102,6 +103,8 @@ class RabbitMQPool:
         subject: str,
         content: str,
         priority: int,
+        original_priority: int = None,
+        enqueue_at: float = None,
     ) -> bool:
         conn = None
         ch = None
@@ -114,6 +117,8 @@ class RabbitMQPool:
                 "subject": subject,
                 "content": content,
                 "priority": priority,
+                "original_priority": original_priority if original_priority is not None else priority,
+                "enqueue_at": enqueue_at if enqueue_at is not None else time.time(),
             }
             properties = pika.BasicProperties(
                 delivery_mode=2,
@@ -130,6 +135,62 @@ class RabbitMQPool:
         except (AMQPConnectionError, AMQPChannelError) as e:
             logger.error("Failed to publish message: %s", e)
             return False
+        finally:
+            if conn and ch:
+                self.release(conn, ch)
+
+    def requeue_with_promotion(
+        self,
+        message_body: dict,
+        new_priority: int,
+    ) -> bool:
+        task_id = message_body.get("task_id")
+        original_priority = message_body.get("original_priority", message_body.get("priority", 1))
+        enqueue_at = message_body.get("enqueue_at", time.time())
+
+        promoted_count = message_body.get("promoted_count", 0) + 1
+
+        logger.warning(
+            "Aging promotion: task %s priority %d -> %d (promoted %d times, waited %.1fs)",
+            task_id,
+            original_priority,
+            new_priority,
+            promoted_count,
+            time.time() - enqueue_at,
+        )
+
+        updated_message = dict(message_body)
+        updated_message["priority"] = new_priority
+        updated_message["promoted_count"] = promoted_count
+
+        return self.publish_message(
+            task_id=task_id,
+            sender=updated_message["sender"],
+            recipient=updated_message["recipient"],
+            subject=updated_message["subject"],
+            content=updated_message["content"],
+            priority=new_priority,
+            original_priority=original_priority,
+            enqueue_at=enqueue_at,
+        )
+
+    def get_queue_depth(self) -> tuple[int, int]:
+        conn = None
+        ch = None
+        try:
+            conn, ch = self.acquire()
+            q = ch.queue_declare(
+                queue=self.queue_name,
+                durable=True,
+                arguments={"x-max-priority": 5},
+                passive=True,
+            )
+            message_count = q.method.message_count
+            consumer_count = q.method.consumer_count
+            return message_count, consumer_count
+        except Exception as e:
+            logger.warning("Failed to get queue depth: %s", e)
+            return -1, -1
         finally:
             if conn and ch:
                 self.release(conn, ch)
