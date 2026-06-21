@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     BATCH_UPDATE_INTERVAL_MS: int = 500
     BATCH_UPDATE_MAX_WORKERS: int = 2
 
+    SCHEDULER_POLL_INTERVAL_SECONDS: int = 5
+    MAX_RETRIES: int = 3
+
     class Config:
         env_file = ".env"
 

@@ -16,7 +16,15 @@ logger = logging.getLogger(__name__)
 
 StatusUpdate = namedtuple(
     "StatusUpdate",
-    ["task_id", "status", "error_message", "sent_at", "created_at"],
+    [
+        "task_id",
+        "status",
+        "error_message",
+        "sent_at",
+        "retry_count",
+        "next_retry_at",
+        "created_at",
+    ],
 )
 
 
@@ -70,15 +78,19 @@ class BatchStatusUpdater:
         status: TaskStatus,
         error_message: Optional[str] = None,
         sent_at: Optional[datetime] = None,
+        retry_count: Optional[int] = None,
+        next_retry_at: Optional[datetime] = None,
     ):
         if not self.enabled:
-            self._sync_update(task_id, status, error_message, sent_at)
+            self._sync_update(task_id, status, error_message, sent_at, retry_count, next_retry_at)
             return
         update = StatusUpdate(
             task_id=task_id,
             status=status,
             error_message=error_message,
             sent_at=sent_at,
+            retry_count=retry_count,
+            next_retry_at=next_retry_at,
             created_at=time.monotonic(),
         )
         self._queue.put(update)
@@ -93,11 +105,15 @@ class BatchStatusUpdater:
         status: TaskStatus,
         error_message: Optional[str],
         sent_at: Optional[datetime],
+        retry_count: Optional[int],
+        next_retry_at: Optional[datetime],
     ):
         db = SessionLocal()
         try:
             from models import crud
-            crud.update_task_status(db, task_id, status, error_message, sent_at)
+            crud.update_task_status(
+                db, task_id, status, error_message, sent_at, retry_count, next_retry_at
+            )
         except Exception as e:
             logger.exception("Sync update failed for task %s: %s", task_id, e)
         finally:
@@ -153,6 +169,8 @@ class BatchStatusUpdater:
             when_clauses = []
             error_when_clauses = []
             sent_at_when_clauses = []
+            retry_count_when_clauses = []
+            next_retry_at_when_clauses = []
             task_ids = []
             params = {}
 
@@ -161,21 +179,29 @@ class BatchStatusUpdater:
                 status_param = f"status_{i}"
                 error_param = f"error_{i}"
                 sent_at_param = f"sent_at_{i}"
+                retry_count_param = f"retry_count_{i}"
+                next_retry_at_param = f"next_retry_at_{i}"
 
                 task_ids.append(f":{task_id_param}")
                 params[task_id_param] = update.task_id
                 params[status_param] = update.status.value
                 params[error_param] = update.error_message
                 params[sent_at_param] = update.sent_at
+                params[retry_count_param] = update.retry_count
+                params[next_retry_at_param] = update.next_retry_at
 
                 when_clauses.append(f"WHEN id = :{task_id_param} THEN :{status_param}::task_status")
                 error_when_clauses.append(f"WHEN id = :{task_id_param} THEN :{error_param}::text")
                 sent_at_when_clauses.append(f"WHEN id = :{task_id_param} THEN :{sent_at_param}::timestamp")
+                retry_count_when_clauses.append(f"WHEN id = :{task_id_param} THEN :{retry_count_param}::integer")
+                next_retry_at_when_clauses.append(f"WHEN id = :{task_id_param} THEN :{next_retry_at_param}::timestamp")
 
             task_ids_str = ", ".join(task_ids)
             case_status = "CASE " + " ".join(when_clauses) + " END"
             case_error = "CASE " + " ".join(error_when_clauses) + " END"
             case_sent_at = "CASE " + " ".join(sent_at_when_clauses) + " END"
+            case_retry_count = "CASE " + " ".join(retry_count_when_clauses) + " END"
+            case_next_retry_at = "CASE " + " ".join(next_retry_at_when_clauses) + " END"
 
             sql = text(f"""
                 UPDATE mail_tasks
@@ -183,6 +209,8 @@ class BatchStatusUpdater:
                     status = {case_status},
                     error_message = COALESCE({case_error}, error_message),
                     sent_at = COALESCE({case_sent_at}, sent_at),
+                    retry_count = COALESCE({case_retry_count}, retry_count),
+                    next_retry_at = COALESCE({case_next_retry_at}, next_retry_at),
                     updated_at = :now
                 WHERE id IN ({task_ids_str})
             """)

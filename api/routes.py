@@ -17,7 +17,7 @@ router = APIRouter()
     response_model=SendMailResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="发送邮件任务",
-    description="接收邮件参数，创建任务并推送到RabbitMQ队列",
+    description="接收邮件参数，创建任务。若指定scheduled_at则定时发送，否则立即推送到RabbitMQ队列",
 )
 def send_mail(
     request: SendMailRequest,
@@ -30,7 +30,15 @@ def send_mail(
         subject=request.subject,
         content=request.content,
         priority=request.priority,
+        scheduled_at=request.scheduled_at,
     )
+
+    if request.scheduled_at:
+        return SendMailResponse(
+            task_id=task.id,
+            status=task.status.value,
+            message=f"邮件任务已创建，将于 {request.scheduled_at.isoformat()} 发送",
+        )
 
     published = rabbitmq_pool.publish_message(
         task_id=task.id,
@@ -58,7 +66,7 @@ def send_mail(
     "/status/{task_id}",
     response_model=TaskStatusResponse,
     summary="查询任务状态",
-    description="根据任务ID查询邮件发送状态",
+    description="根据任务ID查询邮件发送状态，包含重试和定时发送信息",
 )
 def get_task_status(
     task_id: str,
@@ -85,4 +93,8 @@ def get_task_status(
         created_at=_fmt(task.created_at),
         updated_at=_fmt(task.updated_at),
         sent_at=_fmt(task.sent_at),
+        scheduled_at=_fmt(task.scheduled_at),
+        retry_count=task.retry_count,
+        max_retries=task.max_retries,
+        next_retry_at=_fmt(task.next_retry_at),
     )

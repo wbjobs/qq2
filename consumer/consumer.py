@@ -2,7 +2,7 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import pika
@@ -15,6 +15,8 @@ from utils import rabbitmq_pool
 
 logger = logging.getLogger(__name__)
 
+RETRY_DELAYS = [60, 120, 240]
+
 
 class MailConsumer:
     def __init__(self):
@@ -23,6 +25,7 @@ class MailConsumer:
         self.aging_threshold = settings.AGING_THRESHOLD_SECONDS
         self.aging_promotion_priority = settings.AGING_PROMOTION_PRIORITY
         self.high_priority_backlog_threshold = settings.HIGH_PRIORITY_BACKLOG_THRESHOLD
+        self.max_retries = settings.MAX_RETRIES
         self.rate_limiter = TokenBucket(rate=settings.NORMAL_PRIORITY_MAX_RATE)
         self._running = False
         self._connection: Optional[pika.BlockingConnection] = None
@@ -79,6 +82,13 @@ class MailConsumer:
         )
         return True
 
+    def _calculate_next_retry(self, retry_count: int) -> Optional[datetime]:
+        if retry_count >= self.max_retries:
+            return None
+        delay_index = min(retry_count, len(RETRY_DELAYS) - 1)
+        delay_seconds = RETRY_DELAYS[delay_index]
+        return datetime.utcnow() + timedelta(seconds=delay_seconds)
+
     def _check_aging_and_promote(self, message_body: dict) -> bool:
         task_id = message_body.get("task_id")
         priority = message_body.get("priority", 1)
@@ -130,6 +140,40 @@ class MailConsumer:
                     self._current_high_priority_backlog, self.high_priority_backlog_threshold,
                 )
 
+    def _handle_send_failure(
+        self,
+        task_id: str,
+        retry_count: int,
+        error_message: str,
+    ):
+        next_retry_count = retry_count + 1
+
+        if next_retry_count <= self.max_retries:
+            next_retry_at = self._calculate_next_retry(retry_count)
+            delay_seconds = (next_retry_at - datetime.utcnow()).total_seconds() if next_retry_at else 0
+            logger.warning(
+                "Task %s send failed (attempt %d/%d), scheduling retry in %.0fs (exponential backoff)",
+                task_id, next_retry_count, self.max_retries, delay_seconds,
+            )
+            batch_updater.queue_update(
+                task_id,
+                TaskStatus.RETRYING,
+                error_message=error_message,
+                retry_count=next_retry_count,
+                next_retry_at=next_retry_at,
+            )
+        else:
+            logger.error(
+                "Task %s permanently failed after %d attempts: %s",
+                task_id, self.max_retries, error_message,
+            )
+            batch_updater.queue_update(
+                task_id,
+                TaskStatus.FAILED,
+                error_message=f"[重试{self.max_retries}次后失败] {error_message}",
+                retry_count=next_retry_count,
+            )
+
     def _process_message(self, message_body: dict) -> bool:
         task_id = message_body.get("task_id")
         sender = message_body.get("sender")
@@ -137,6 +181,7 @@ class MailConsumer:
         subject = message_body.get("subject")
         content = message_body.get("content")
         priority = message_body.get("priority", 1)
+        retry_count = message_body.get("retry_count", 0)
 
         if not all([task_id, sender, recipient, subject, content]):
             logger.error("Invalid message format: %s", message_body)
@@ -148,7 +193,7 @@ class MailConsumer:
             logger.info("Task %s has been promoted, skipping current processing", task_id)
             return True
 
-        batch_updater.queue_update(task_id, TaskStatus.PROCESSING)
+        batch_updater.queue_update(task_id, TaskStatus.PROCESSING, retry_count=retry_count)
 
         try:
             is_high_priority = priority >= self.high_priority_threshold
@@ -174,33 +219,33 @@ class MailConsumer:
 
             if success:
                 batch_updater.queue_update(
-                    task_id, TaskStatus.SUCCESS, sent_at=datetime.utcnow()
+                    task_id, TaskStatus.SUCCESS, sent_at=datetime.utcnow(),
+                    retry_count=retry_count,
                 )
                 logger.info("Mail task %s completed successfully", task_id)
             else:
-                batch_updater.queue_update(
-                    task_id, TaskStatus.FAILED, error_message="SMTP send failed"
+                self._handle_send_failure(
+                    task_id, retry_count, "SMTP send failed"
                 )
-                logger.error("Mail task %s failed: SMTP send returned false", task_id)
 
-            return success
+            return True
         except Exception as e:
-            logger.exception("Error processing task %s: %s", task_id, e)
-            batch_updater.queue_update(
-                task_id, TaskStatus.FAILED, error_message=str(e)
-            )
-            return False
+            error_msg = str(e)
+            logger.exception("Error processing task %s: %s", task_id, error_msg)
+            self._handle_send_failure(task_id, retry_count, error_msg)
+            return True
 
     def _on_message(self, ch, method, properties, body):
         try:
             message = json.loads(body.decode("utf-8"))
             logger.info(
-                "Received message | task_id=%s | priority=%s",
+                "Received message | task_id=%s | priority=%s | retry=%s",
                 message.get("task_id"),
                 properties.priority if properties else "unknown",
+                message.get("retry_count", 0),
             )
-            success = self._process_message(message)
-            if success:
+            consumed = self._process_message(message)
+            if consumed:
                 ch.basic_ack(delivery_tag=method.delivery_tag)
             else:
                 ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)

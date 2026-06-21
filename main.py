@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api import router as api_router
-from consumer import MailConsumer
+from consumer import MailConsumer, task_scheduler
 from models import init_db
 from utils import rabbitmq_pool
 
@@ -52,7 +52,13 @@ async def lifespan(app: FastAPI):
     logger.info("Starting mail consumer...")
     _start_consumer()
 
+    logger.info("Starting task scheduler...")
+    task_scheduler.start()
+
     yield
+
+    logger.info("Stopping task scheduler...")
+    task_scheduler.stop()
 
     logger.info("Shutting down mail consumer...")
     _stop_consumer()
@@ -64,8 +70,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Mail Queue Service",
-    description="基于 RabbitMQ 的邮件发送队列服务",
-    version="1.0.0",
+    description="基于 RabbitMQ 的邮件发送队列服务，支持定时发送和指数退避重试",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -87,6 +93,7 @@ def health_check():
 
 def _handle_signal(signum, frame):
     logger.info("Received signal %s, shutting down...", signum)
+    task_scheduler.stop()
     _stop_consumer()
     rabbitmq_pool.close_all()
     sys.exit(0)
